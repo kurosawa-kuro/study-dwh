@@ -183,3 +183,239 @@
 - スター・スキーマをまずは小規模データでローカルに作り、実際にSQLで集計してみるとDWHの仕組みがよく分かります。
 
 これらのサンプル設計を出発点に、独自の項目やテーブルを足し引きしながら、ご自身のアプリや興味のあるドメインに合わせてカスタマイズしてみてください。
+
+===================================================
+
+以下では、**DuckDB** を使ったスター・スキーマ（Todoアプリ例）のチュートリアルを示します。  
+**ポイント**: CSVファイルから読み込むのではなく、直接 SQL の INSERT 文で数件のデータを投入してみます。  
+
+---
+
+## 1. DuckDB の準備
+
+DuckDB はシングルバイナリで動作し、以下のように簡単に試せます。
+
+1. **インストール**  
+   - Python環境下で `pip install duckdb` する  
+   - または [DuckDB公式サイト](https://duckdb.org/)からバイナリを入手  
+2. **DuckDBシェルを起動**  
+   - ターミナル/コマンドラインで `duckdb` と入力してシェルを起動  
+   - または Python上で `import duckdb` 後 `duckdb.connect('mydb.duckdb')` する  
+
+以下のサンプルSQLは、DuckDBシェル上で動かす想定です（`mydb.duckdb` というファイルがあればそこに保存されます）。
+
+---
+
+## 2. スター・スキーマのテーブル作成
+
+### 2.1 ディメンションテーブル
+
+#### `dim_user` (ユーザー)
+
+```sql
+CREATE TABLE dim_user (
+    user_key           INTEGER NOT NULL,  -- サロゲートキー
+    user_id            VARCHAR,           -- 実アプリのユーザーID
+    user_name          VARCHAR,
+    email              VARCHAR,
+    registration_date  DATE,
+    PRIMARY KEY (user_key)
+);
+```
+
+#### `dim_date` (日付)
+
+```sql
+CREATE TABLE dim_date (
+    date_key       INTEGER NOT NULL,  -- YYYYMMDD の形を想定
+    date_actual    DATE NOT NULL,
+    year           INTEGER,
+    month          INTEGER,
+    day_of_week    INTEGER,           -- 0=日曜,1=月曜...など
+    is_weekend     BOOLEAN,
+    PRIMARY KEY (date_key)
+);
+```
+
+#### `dim_task` (タスク)  
+※ 必要に応じて作成します。小規模なら省略してもOK。
+
+```sql
+CREATE TABLE dim_task (
+    task_key         INTEGER NOT NULL, -- サロゲートキー
+    task_id          VARCHAR,          -- 実アプリのタスクID
+    title            VARCHAR,
+    category         VARCHAR,          -- "仕事", "プライベート" など
+    due_date_key     INTEGER,          -- 締切日を日付ディメンションに紐づけたい場合
+    PRIMARY KEY (task_key)
+);
+```
+
+### 2.2 ファクトテーブル
+
+#### `fact_task_actions` (タスクに対するアクション)
+
+```sql
+CREATE TABLE fact_task_actions (
+    task_action_id  INTEGER NOT NULL,  -- サロゲートキー
+    task_id         VARCHAR,           -- (または task_key をFKにする)
+    user_key        INTEGER,           -- FK: dim_user
+    date_key        INTEGER,           -- FK: dim_date (いつのアクションか)
+    action_type     VARCHAR,           -- "create", "complete", "update", etc.
+    elapsed_minutes INTEGER,           -- 完了までにかかった時間など
+    priority_flag   BOOLEAN,           -- 優先タスクかどうか
+    is_completed    BOOLEAN,           -- 0/1 または FALSE/TRUE
+    -- メトリック例: アクション回数=1 とか、実際に集計したい値を列に追加しても良い
+    PRIMARY KEY (task_action_id)
+    -- FOREIGN KEY (user_key) REFERENCES dim_user(user_key),  (DuckDBでは外部キーはまだ実験的)
+    -- FOREIGN KEY (date_key) REFERENCES dim_date(date_key)
+);
+```
+
+---
+
+## 3. サンプルデータの投入 (直接INSERT)
+
+CSVからの読み込みではなく、単純化のため少量のデータを**INSERT文**で投入してみます。
+
+### 3.1 ディメンションテーブルへのINSERT
+
+#### `dim_user`
+```sql
+INSERT INTO dim_user 
+    (user_key, user_id, user_name, email, registration_date)
+VALUES
+    (1, 'usr001', 'Alice', 'alice@example.com', '2023-01-10'),
+    (2, 'usr002', 'Bob',   'bob@example.com',   '2023-02-15'),
+    (3, 'usr003', 'Charlie', NULL,              '2023-03-20');
+```
+
+#### `dim_date`  
+(※ `date_key` に YYYYMMDD 形式を想定)
+
+```sql
+INSERT INTO dim_date
+    (date_key, date_actual, year, month, day_of_week, is_weekend)
+VALUES
+    (20230110, DATE '2023-01-10', 2023, 1, 2, FALSE),
+    (20230111, DATE '2023-01-11', 2023, 1, 3, FALSE),
+    (20230215, DATE '2023-02-15', 2023, 2, 3, FALSE),
+    (20230320, DATE '2023-03-20', 2023, 3, 1, FALSE),
+    (20230321, DATE '2023-03-21', 2023, 3, 2, FALSE); -- 例として
+```
+
+#### `dim_task`  
+(※ タスクディメンションも一例として)
+
+```sql
+INSERT INTO dim_task
+    (task_key, task_id, title, category, due_date_key)
+VALUES
+    (101, 'tsk001', 'Buy groceries',   'プライベート', 20230111),
+    (102, 'tsk002', 'Prepare report',  '仕事',         20230215),
+    (103, 'tsk003', 'Exercise',        'プライベート', 20230321);
+```
+
+### 3.2 ファクトテーブルへのINSERT
+
+#### `fact_task_actions`  
+(※ ファクトなので、タスクに対するアクションを1行ずつ記録)
+
+```sql
+-- 例: Alice が 2023/01/10 に tsk001を "作成" した
+INSERT INTO fact_task_actions
+    (task_action_id, task_id, user_key, date_key, action_type, elapsed_minutes, priority_flag, is_completed)
+VALUES
+    (1001, 'tsk001', 1, 20230110, 'create',  NULL, FALSE, FALSE),
+    (1002, 'tsk001', 1, 20230111, 'complete', 60,   FALSE, TRUE),
+
+    -- Bob が 2023/02/15 に tsk002 を作成
+    (1003, 'tsk002', 2, 20230215, 'create',  NULL, TRUE,  FALSE),
+
+    -- Charlie が 2023/03/20 に tsk003 を作成
+    (1004, 'tsk003', 3, 20230320, 'create',  NULL, FALSE, FALSE),
+    -- 2023/03/21 に完了
+    (1005, 'tsk003', 3, 20230321, 'complete', 30,  FALSE, TRUE);
+```
+
+---
+
+## 4. 分析クエリ例
+
+### 4.1 ユーザー別のタスク完了数を集計
+
+以下の例では、`fact_task_actions` から完了アクション (`action_type = 'complete'`) を抽出し、  
+ユーザー名とその完了数を一覧にします。
+
+```sql
+SELECT u.user_name,
+       COUNT(*) AS completed_task_count
+FROM fact_task_actions f
+JOIN dim_user u ON f.user_key = u.user_key
+WHERE f.action_type = 'complete'
+GROUP BY u.user_name;
+```
+
+#### 実行結果（例）
+```
+ user_name | completed_task_count 
+-----------+----------------------
+ Alice     | 1
+ Charlie   | 1
+(など)
+```
+
+### 4.2 期日(due_date_key)と完了日(date_key)を比較して遅延率を出す (例)
+
+タスクディメンション(`dim_task`)で `due_date_key` を持ち、  
+ファクト側で `complete` アクションの日付を取得して、差を比較します。
+
+```sql
+-- タスク完了アクションに限定し、期日(due_date)と完了日(complete_date)の差を出す
+WITH completed_tasks AS (
+  SELECT
+    f.task_id,
+    f.date_key AS complete_date_key,
+    t.due_date_key
+  FROM fact_task_actions f
+  JOIN dim_task t 
+    ON f.task_id = t.task_id
+  WHERE f.action_type = 'complete'
+)
+SELECT
+  c.task_id,
+  c.due_date_key,
+  c.complete_date_key,
+  (c.complete_date_key - c.due_date_key) AS days_late
+    -- (※ date_keyをYYYYMMDDとして引き算すると正しい“日数”にはならない場合もあるので注意。 
+    --  正確に差を取りたければ dim_date やDATE型の列同士を引き算)
+FROM completed_tasks c;
+```
+
+**Note**: `YYYYMMDD` 形式をそのまま差し引くと真の日数差にはならないので、  
+`dim_date` の `date_actual` をJOINして `DATEDIFF` を使うなどが一般的です。DuckDBであれば:
+
+```sql
+SELECT
+  DATEDIFF('day', d_due.date_actual, d_comp.date_actual) AS days_late
+FROM completed_tasks c
+JOIN dim_date d_due ON c.due_date_key = d_due.date_key
+JOIN dim_date d_comp ON c.complete_date_key = d_comp.date_key;
+```
+
+---
+
+## 5. まとめ & 追加ポイント
+
+1. **ファクトテーブル `fact_task_actions`**  
+   - タスクのアクションごとに行が増える  
+   - 分析したいメトリック（完了時間, 優先フラグなど）を持たせておく  
+2. **ディメンション `dim_user`, `dim_date`, `dim_task`**  
+   - ユーザー、日付、タスクなどをキーでJOINし、集計用の属性データを補足  
+3. **INSERTだけでなくCSVやParquetから読み込みも可能**  
+   - ただし今回はINSERT例に限定  
+4. **分析クエリ**  
+   - JOINしてグループ化する、日付差を計算する、などがスター・スキーマの基本パターン
+
+DuckDB は軽量かつ分析に強いDBエンジンなので、上記のようなスキーマ設計においても、  
+サクッと試せるのがメリットです。必要な行数を増やしたり、パーティショニング的に外部ファイルを参照することも比較的容易にできるので、活用してみてください。
