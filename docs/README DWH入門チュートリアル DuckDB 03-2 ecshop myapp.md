@@ -332,3 +332,327 @@ df_q3
   分析用に最適化されたテーブル設計(スター・スキーマ)のメリットを即実感できます。  
 - ぜひ、実際の注文・返品・商品・ユーザなどの**データを抽出**してスター・スキーマを構築し、  
   その上で BIツールやSQLを使ったレポーティングを行ってみてください。  
+
+  ===============================================================================================================================================
+
+  以下では、**商品とカテゴリが多対多**である点を反映し、  
+**スノーフレークスキーマ** を取り入れた **DuckDB×ECショップDWH** のサンプルチュートリアルを改訂します。  
+
+もともとスター・スキーマ的に `dim_product` へ `category` カラムを1つだけ持たせていましたが、  
+「**1商品 : Nカテゴリ**」のケースでは、  
+**`dim_product`** と **`dim_category`** を分割し、さらに **ブリッジテーブル** を挟むことで多対多を扱います。
+
+---
+
+# DuckDB × ECショップ: 多対多カテゴリ対応 (スノーフレーク化)
+
+## 1. Prismaスキーマでの多対多
+
+あなたのECショップでは、
+
+```prisma
+model Product {
+  ...
+  productCategories ProductCategory[]
+}
+
+model Category {
+  ...
+  productCategories ProductCategory[]
+}
+
+model ProductCategory {
+  productId  Int
+  categoryId Int
+  ...
+}
+```
+
+という形で商品(Product)とカテゴリ(Category)が多対多になっています。  
+この**多対多**を分析DWHにも落とし込む場合、単純に「`dim_product` に1つのカテゴリIDを持たせる」設計では足りません。
+
+---
+
+## 2. スノーフレークスキーマの構成イメージ
+
+下記のように、**商品ディメンション (dim_product)** と **カテゴリディメンション (dim_category)** を分け、  
+**`product_category_bridge`** テーブルを設けることで「1商品が複数カテゴリに属する」関係を表現します。  
+ファクトテーブル (`fact_sales` など) は引き続き `product_key` を持ち、そこから**2段階JOIN** でカテゴリへ辿るイメージです。
+
+```
+fact_sales
+   └── (product_key) ─> dim_product
+                         └── product_category_bridge ─> dim_category
+```
+
+- **dim_product** … 商品ID・商品名・価格など、単一の商品の属性  
+- **dim_category** … カテゴリID・カテゴリ名・階層など  
+- **product_category_bridge** … product_key, category_key の組み合わせを持つ多対多ブリッジ  
+
+この構造がいわゆる**スノーフレーク**(snowflake)で、スター・スキーマをさらに分割し、ディメンション同士が1対多で連なる形です。
+
+---
+
+## 3. ダミーデータ例 (pandas)
+
+### 3.1 ディメンション: `dim_product` (商品)
+
+```python
+df_product = pd.DataFrame({
+    'product_key': [101, 102, 103],
+    'name': ['Laptop', 'T-Shirt', 'Coffee Beans'],
+    'price': [1200.0, 20.0, 8.5],
+    # ここではカテゴリは入れず、多対多は bridge で扱う
+})
+```
+
+### 3.2 ディメンション: `dim_category` (カテゴリ)
+
+```python
+df_category = pd.DataFrame({
+    'category_key': [201, 202, 203, 204],
+    'category_name': ['Electronics', 'Apparel', 'Beverage', 'Food']
+})
+```
+
+### 3.3 ブリッジ: `product_category_bridge`
+
+- 下記例では
+  - Laptop (101) → [201=Electronics]  
+  - T-Shirt (102) → [202=Apparel]  
+  - Coffee Beans (103) → [203=Beverage, 204=Food] (複数カテゴリ)
+
+```python
+df_product_category_bridge = pd.DataFrame({
+    'product_key': [101, 102, 103, 103],
+    'category_key': [201, 202, 203, 204]
+})
+```
+
+### 3.4 ファクト: `fact_sales`
+
+- ここでは1つの注文明細相当を1行とし、
+  - `user_key`: 誰が
+  - `product_key`: どの商品を
+  - `date_key`: いつ
+  - `quantity`, `price` など
+
+```python
+df_fact_sales = pd.DataFrame({
+    'sale_id': [1001, 1002, 1003],
+    'user_key': ['u001', 'u002', 'u002'],
+    'product_key': [101, 103, 103],   # 101=Laptop, 103=CoffeeBeans
+    'date_key': [20230110, 20230205, 20230205],
+    'quantity': [1, 1, 2],
+    'price': [1200.0, 8.5, 8.5],
+})
+```
+
+※ ユーザや日付は前回同様 `dim_user`, `dim_date` として準備してください。
+
+---
+
+## 4. DuckDBでスノーフレークスキーマを作る
+
+### 4.1 テーブル作成
+
+```python
+import duckdb
+
+con = duckdb.connect(database=':memory:')
+
+# ディメンション: product
+con.execute("""
+CREATE TABLE dim_product (
+  product_key INT,
+  name VARCHAR,
+  price DOUBLE
+);
+""")
+
+# ディメンション: category
+con.execute("""
+CREATE TABLE dim_category (
+  category_key INT,
+  category_name VARCHAR
+);
+""")
+
+# ブリッジ: product_category_bridge (多対多)
+con.execute("""
+CREATE TABLE product_category_bridge (
+  product_key INT,
+  category_key INT
+);
+""")
+
+# ファクト: fact_sales
+con.execute("""
+CREATE TABLE fact_sales (
+  sale_id INT,
+  user_key VARCHAR,
+  product_key INT,
+  date_key INT,
+  quantity INT,
+  price DOUBLE
+);
+""")
+
+# (dim_user, dim_dateなど他のテーブルも同様に作成してください)
+```
+
+### 4.2 ダミーデータINSERT
+
+```python
+con.register("temp_product", df_product)
+con.register("temp_category", df_category)
+con.register("temp_prodcatbridge", df_product_category_bridge)
+con.register("temp_fact_sales", df_fact_sales)
+
+con.execute("INSERT INTO dim_product SELECT * FROM temp_product")
+con.execute("INSERT INTO dim_category SELECT * FROM temp_category")
+con.execute("INSERT INTO product_category_bridge SELECT * FROM temp_prodcatbridge")
+con.execute("INSERT INTO fact_sales SELECT * FROM temp_fact_sales")
+```
+
+---
+
+以下は、**多対多のカテゴリ**を扱うために**スノーフレークスキーマ**を取り入れたバージョンの **JOIN + 集計クエリ例** です。  
+(前提として、下記のように **`dim_product`**, **`dim_category`**, **`product_category_bridge`** を用意し、商品とカテゴリを多対多でつないでいることを想定しています。)
+
+---
+
+## 多対多カテゴリ対応のスノーフレーク構造
+
+\`\`\`mermaid
+flowchart LR
+    fact_sales -- product_key --> dim_product
+    dim_product -- product_key --> product_category_bridge
+    product_category_bridge -- category_key --> dim_category
+\`\`\`
+
+1. **`fact_sales`** : ファクトテーブル (売上明細)  
+2. **`dim_product`** : 商品ディメンション  
+3. **`dim_category`** : カテゴリディメンション  
+4. **`product_category_bridge`** : 多対多を表すブリッジテーブル (1商品 : Nカテゴリ)
+
+---
+
+## 1. カテゴリ別の売上数量 / 合計金額を求める
+
+```python
+# %% [code]
+query1 = """
+SELECT
+  c.category_name,
+  SUM(s.quantity) AS total_qty,
+  SUM(s.quantity * s.price) AS total_sales_amount
+FROM fact_sales s
+JOIN dim_product p
+  ON s.product_key = p.product_key
+JOIN product_category_bridge pcb
+  ON p.product_key = pcb.product_key
+JOIN dim_category c
+  ON pcb.category_key = c.category_key
+GROUP BY c.category_name
+ORDER BY total_sales_amount DESC
+"""
+
+df_q1 = con.execute(query1).df()
+df_q1
+```
+
+<details>
+<summary>想定出力例</summary>
+
+```
+  category_name  total_qty  total_sales_amount
+0  Electronics          1             1200.0
+1       Apparel         2               40.0
+2     Beverage          3               25.5
+3          Food         3               25.5
+```
+</details>
+
+ここでは、**1つの商品が複数カテゴリに属している**場合、その売上が両カテゴリに加算されます。  
+(例えば「Coffee Beans (ProductID=103)」が “Beverage” と “Food” の2つに属している、といったケース)
+
+---
+
+## 2. ユーザステータス別の購入回数
+
+```python
+# %% [code]
+query2 = """
+SELECT
+  u.status,
+  COUNT(*) AS purchase_count
+FROM fact_sales s
+JOIN dim_user u
+  ON s.user_key = u.user_key
+GROUP BY u.status
+ORDER BY purchase_count DESC
+"""
+
+df_q2 = con.execute(query2).df()
+df_q2
+```
+
+<details>
+<summary>想定出力例</summary>
+
+```
+   status   purchase_count
+0   ACTIVE               2
+1 DISABLED               1
+```
+</details>
+
+商品とカテゴリの多対多関係には関係なく、**ユーザの状態**（ACTIVE/INACTIVE など）ごとに購入した明細数を数えています。
+
+---
+
+## 3. 日付ディメンションを活用して月別の売上を出す
+
+```python
+# %% [code]
+query3 = """
+SELECT
+  d.year,
+  d.month,
+  SUM(s.quantity * s.price) AS total_amount
+FROM fact_sales s
+JOIN dim_date d
+  ON s.date_key = d.date_key
+GROUP BY d.year, d.month
+ORDER BY d.year, d.month
+"""
+
+df_q3 = con.execute(query3).df()
+df_q3
+```
+
+<details>
+<summary>想定出力例</summary>
+
+```
+   year  month  total_amount
+0  2023      1        1200.0
+1  2023      2          40.0
+2  2023      3           8.5
+```
+</details>
+
+日付ディメンションの `year`, `month` 列を使って、月別の売上合計を集計しています。  
+（他にも `weekday` や `quarter`, `fiscal_year` などを持たせれば、様々な粒度で集計が可能になります。）
+
+---
+
+## まとめ
+
+- **多対多のカテゴリ**を正しく集計するには、スター・スキーマをそのまま使うのではなく、  
+  **スノーフレークスキーマ** (商品ディメンションとカテゴリディメンションを分割し、ブリッジテーブルで多対多を表現) が必要になるケースが多いです。  
+- その際は、ファクトテーブルとカテゴリを紐付けるために **2段階JOIN** (product → product_category_bridge → category) を行うことを忘れないようにしてください。  
+- それ以外の分析（ユーザセグメント別や日付別の集計）は、従来のスター・スキーマと同様に簡単に行えます。  
+
+これらのクエリ例をベースに、**実際のECデータ**で多対多カテゴリを考慮したスノーフレーク構造を設計し、各種レポートやダッシュボードで分析を行ってみてください。
